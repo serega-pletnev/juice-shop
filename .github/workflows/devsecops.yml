@@ -1,3 +1,4 @@
+cat > .github/workflows/devsecops.yml <<'YAML'
 name: DevSecOps CI (SAST/SCA/Secrets/Image + Local DAST)
 
 on:
@@ -20,7 +21,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with:
+          node-version: '20'
       - name: Install & unit tests
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
@@ -39,13 +41,17 @@ jobs:
           docker run --rm -v "${PWD}:/src" returntocorp/semgrep:latest \
             semgrep --config /src/ci/semgrep.yml --error --json -o /src/semgrep.json /src || true
       - uses: github/codeql-action/upload-sarif@v3
-        with: { sarif_file: semgrep.sarif }
+        with:
+          sarif_file: semgrep.sarif
       - uses: actions/upload-artifact@v4
-        with: { name: semgrep.json, path: semgrep.json }
+        with:
+          name: semgrep.json
+          path: semgrep.json
 
   codeql:
     runs-on: ubuntu-latest
-    permissions: { security-events: write }
+    permissions:
+      security-events: write
     steps:
       - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3
@@ -63,7 +69,9 @@ jobs:
           docker run --rm -v "$PWD:/path" zricethezav/gitleaks:latest detect \
             --exit-code 0 -s /path -c /path/ci/gitleaks.toml -f json -r /path/gitleaks.json --no-git
       - uses: actions/upload-artifact@v4
-        with: { name: gitleaks.json, path: gitleaks.json }
+        with:
+          name: gitleaks.json
+          path: gitleaks.json
 
   trivy_fs_sbom:
     runs-on: ubuntu-latest
@@ -74,12 +82,19 @@ jobs:
           mkdir -p SBOM
           docker run --rm -v "$PWD:/src" aquasec/trivy:latest fs --config /src/ci/trivy.yaml \
             --scanners vuln,secret,misconfig --output /src/trivy-fs.sarif /src
-         
+          # SBOM через Syft (CycloneDX JSON)
           docker run --rm -v "$PWD:/work" anchore/syft:latest /work -o cyclonedx-json > SBOM/juice-shop.cdx.json
       - uses: github/codeql-action/upload-sarif@v3
-        with: { sarif_file: trivy-fs.sarif }
+        with:
+          sarif_file: trivy-fs.sarif
       - uses: actions/upload-artifact@v4
-        with: { name: SBOM, path: SBOM/ }
+        with:
+          name: trivy-fs.sarif
+          path: trivy-fs.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SBOM
+          path: SBOM/
 
   build_image_scan:
     runs-on: ubuntu-latest
@@ -90,12 +105,19 @@ jobs:
         run: docker build -t app-image:ci .
       - name: Trivy image scan
         run: |
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest \
-            image --format sarif --severity CRITICAL,HIGH --ignore-unfixed -o trivy-image.sarif app-image:ci
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD:/work" \
+            aquasec/trivy:latest \
+            image --format sarif --severity CRITICAL,HIGH --ignore-unfixed \
+            -o /work/trivy-image.sarif app-image:ci
       - uses: github/codeql-action/upload-sarif@v3
-        with: { sarif_file: trivy-image.sarif }
+        with:
+          sarif_file: trivy-image.sarif
       - uses: actions/upload-artifact@v4
-        with: { name: trivy-image.sarif, path: trivy-image.sarif }
+        with:
+          name: trivy-image.sarif
+          path: trivy-image.sarif
 
   gate_pre_dast:
     runs-on: ubuntu-latest
@@ -103,7 +125,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-        with: { path: artifacts }
+        with:
+          path: artifacts
       - name: Install jq
         run: sudo apt-get update -y && sudo apt-get install -y jq
       - name: Security Gate (SAST/SCA/Secrets/Image)
@@ -149,3 +172,5 @@ jobs:
           echo "ZAP High=$highs Medium=$meds"
           if [ "$highs" -gt 0 ] || [ "$meds" -gt 5 ]; then echo "ZAP gate fail"; exit 1; fi
           if [ -s nuclei.txt ]; then echo "Nuclei findings present"; cat nuclei.txt; exit 1; fi
+YAML
+
