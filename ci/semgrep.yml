@@ -1,0 +1,8 @@
+configs:
+  - p/owasp-top-ten
+  - p/security-audit
+  - p/nodejsscan
+  - p/jwt
+  - p/sql-injection
+severity: WARNING
+exclude: [ node_modules, dist ]

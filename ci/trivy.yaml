@@ -1,0 +1,4 @@
+vulnType: ["os","library"]
+format: "sarif"
+severity: ["CRITICAL","HIGH"]
+ignoreUnfixed: true
