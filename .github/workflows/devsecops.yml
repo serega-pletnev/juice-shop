@@ -23,18 +23,21 @@ jobs:
         with: { node-version: 20 }
       - name: Install & unit tests
         run: |
-          npm ci
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
           npm test --if-present || true
 
   semgrep:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Semgrep scan
+      - name: Semgrep SARIF
         run: |
           docker run --rm -v "${PWD}:/src" returntocorp/semgrep:latest \
-            semgrep --config /src/ci/semgrep.yml --error \
-            --json --output semgrep.json --sarif --output semgrep.sarif || true
+            semgrep --config /src/ci/semgrep.yml --error --sarif -o semgrep.sarif || true
+      - name: Semgrep JSON
+        run: |
+          docker run --rm -v "${PWD}:/src" returntocorp/semgrep:latest \
+            semgrep --config /src/ci/semgrep.yml --error --json -o semgrep.json || true
       - uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: semgrep.sarif }
       - uses: actions/upload-artifact@v4
@@ -71,8 +74,8 @@ jobs:
           mkdir -p SBOM
           docker run --rm -v "$PWD:/src" aquasec/trivy:latest fs --config /src/ci/trivy.yaml \
             --scanners vuln,secret,misconfig --output trivy-fs.sarif /src
-          docker run --rm -v "$PWD:/src" cyclonedx/cyclonedx-npm:latest \
-            -o /src/SBOM/juice-shop.cdx.json -j /src
+          # SBOM через Syft в формате CycloneDX JSON
+          docker run --rm -v "$PWD:/work" anchore/syft:latest /work -o cyclonedx-json > SBOM/juice-shop.cdx.json
       - uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: trivy-fs.sarif }
       - uses: actions/upload-artifact@v4
