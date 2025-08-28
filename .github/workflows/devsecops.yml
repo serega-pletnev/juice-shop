@@ -61,7 +61,7 @@ jobs:
       - name: Gitleaks
         run: |
           docker run --rm -v "$PWD:/path" zricethezav/gitleaks:latest detect \
-            --exit-code 0 -s /path -c /path/ci/gitleaks.toml -f json -r gitleaks.json --no-git
+            --exit-code 0 -s /path -c /path/ci/gitleaks.toml -f json -r /path/gitleaks.json --no-git
       - uses: actions/upload-artifact@v4
         with: { name: gitleaks.json, path: gitleaks.json }
 
