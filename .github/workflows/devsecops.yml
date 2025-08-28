@@ -91,7 +91,7 @@ jobs:
       - name: Trivy image scan
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest \
-            image --config /github/workspace/ci/trivy.yaml --output trivy-image.sarif app-image:ci
+            image --format sarif --severity CRITICAL,HIGH --ignore-unfixed -o trivy-image.sarif app-image:ci
       - uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: trivy-image.sarif }
       - uses: actions/upload-artifact@v4
