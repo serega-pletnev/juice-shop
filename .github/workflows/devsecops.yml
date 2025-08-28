@@ -33,11 +33,11 @@ jobs:
       - name: Semgrep SARIF
         run: |
           docker run --rm -v "${PWD}:/src" returntocorp/semgrep:latest \
-            semgrep --config /src/ci/semgrep.yml --error --sarif -o semgrep.sarif || true
+            semgrep --config /src/ci/semgrep.yml --error --sarif -o /src/semgrep.sarif /src || true
       - name: Semgrep JSON
         run: |
           docker run --rm -v "${PWD}:/src" returntocorp/semgrep:latest \
-            semgrep --config /src/ci/semgrep.yml --error --json -o semgrep.json || true
+            semgrep --config /src/ci/semgrep.yml --error --json -o /src/semgrep.json /src || true
       - uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: semgrep.sarif }
       - uses: actions/upload-artifact@v4
@@ -73,8 +73,8 @@ jobs:
         run: |
           mkdir -p SBOM
           docker run --rm -v "$PWD:/src" aquasec/trivy:latest fs --config /src/ci/trivy.yaml \
-            --scanners vuln,secret,misconfig --output trivy-fs.sarif /src
-          # SBOM через Syft в формате CycloneDX JSON
+            --scanners vuln,secret,misconfig --output /src/trivy-fs.sarif /src
+         
           docker run --rm -v "$PWD:/work" anchore/syft:latest /work -o cyclonedx-json > SBOM/juice-shop.cdx.json
       - uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: trivy-fs.sarif }
