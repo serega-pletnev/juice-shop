@@ -2,34 +2,44 @@
 FROM node:20-bookworm-slim AS builder
 WORKDIR /app
 
-# Инструменты для сборки нативных модулей и git-зависимостей
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
 
-# 1) сначала только манифесты (лучший кеш слоёв)
+# 1) сперва только манифесты (чтоб кеш слоёв работал)
 COPY package*.json ./
-COPY frontend/package*.json ./frontend/
+COPY frontend/package*.json ./frontend/ 2>/dev/null || true
 
-# 2) ставим корневые зависимости БЕЗ lifecycle-скриптов
 ENV npm_config_audit=false npm_config_fund=false
-RUN npm ci --ignore-scripts --legacy-peer-deps
 
-# 3) зависимости фронта без скриптов
-RUN npm ci --ignore-scripts --legacy-peer-deps --prefix frontend
+# 2) корневые зависимости БЕЗ скриптов, с fallback на install при отсутствии lock
+RUN if [ -f package-lock.json ]; then \
+      npm ci --ignore-scripts --legacy-peer-deps; \
+    else \
+      npm install --ignore-scripts --legacy-peer-deps; \
+    fi
+
+# 3) зависимости фронта (если есть), тоже с fallback
+RUN if [ -d frontend ]; then \
+      if [ -f frontend/package-lock.json ]; then \
+        npm ci --ignore-scripts --legacy-peer-deps --prefix frontend; \
+      else \
+        npm install --ignore-scripts --legacy-peer-deps --prefix frontend; \
+      fi; \
+    fi
 
 # 4) теперь копируем остальной код
 COPY . .
 
-# 5) даём отработать postinstall/пересборке уже при наличии проекта
+# 5) пересборка нативных модулей (теперь проект уже на месте)
 RUN npm rebuild --unsafe-perm || true
-RUN npm --prefix frontend rebuild --unsafe-perm || true
+RUN if [ -d frontend ]; then npm --prefix frontend rebuild --unsafe-perm || true; fi
 
-# 6) сборка (если есть соответствующие скрипты)
+# 6) сборка (если скрипты есть)
 RUN npm run build --if-present || true
-RUN npm --prefix frontend run build --if-present || true
+RUN if [ -d frontend ]; then npm --prefix frontend run build --if-present || true; fi
 
-# 7) отрезаем dev-зависимости и чистим кэш
+# 7) оставляем только прод-зависимости
 RUN npm prune --omit=dev && npm cache clean --force
 
 # ---------- Stage 2: runtime ----------
@@ -41,7 +51,6 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# минимальный рантайм: прод-зависимости и собранные артефакты
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app ./
 
