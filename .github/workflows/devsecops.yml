@@ -135,7 +135,8 @@ jobs:
           echo "app did not start in time"; docker logs web; exit 1
       - name: ZAP baseline (local)
         run: |
-          docker run --rm --network scan -t owasp/zap2docker-stable zap-baseline.py \
+      docker pull ghcr.io/zaproxy/zaproxy:stable
+          docker run --rm --network scan -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
             -t "http://web:3000" -r zap.html -J zap.json -m 5 -d -I
       - name: Nuclei (local)
         run: |
