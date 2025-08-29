@@ -3,15 +3,19 @@ FROM node:20-alpine3.20
 ENV NODE_ENV=production
 WORKDIR /app
 
-# Нужно git (и только при необходимости node-gyp: python3 make g++)
-RUN apk add --no-cache git
+# Нужны git и совместимость с glibc (часто для бинарей npm)
+RUN apk add --no-cache git libc6-compat
+
+# Временные пакеты для node-gyp (снесём после install)
+RUN apk add --no-cache --virtual .build-deps python3 make g++ pkgconf
 
 COPY package*.json ./
 
-# Устанавливаем только прод-зависимости
+# Ставим только прод-зависимости
 RUN npm config set audit false && npm config set fund false \
  && if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi \
- && npm cache clean --force
+ && npm cache clean --force \
+ && apk del .build-deps
 
 COPY . .
 
