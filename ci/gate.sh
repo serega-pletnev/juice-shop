@@ -2,70 +2,54 @@
 set -euo pipefail
 
 MODE="${1:-pre}"
-WS="${GITHUB_WORKSPACE:-$PWD}"
 
-case "$MODE" in
-  pre)
-    echo "[gate] PRE: checking that security artifacts exist (SAST/SCA/Secrets/Image)"
-    found=0
-    # Ищем любые релевантные артефакты, созданные предыдущими шагами
-    for f in \
-      "$WS"/semgrep*.sarif \
-      "$WS"/codeql*.sarif \
-      "$WS"/trivy*.sarif \
-      "$WS"/gitleaks*.json \
-      "$WS"/sbom*.json "$WS"/*.spdx.json "$WS"/*sbom*.json
-    do
-      if [ -f "$f" ]; then
-        echo "  + found: $(basename "$f")"
-        found=1
-      fi
-    done
+fail(){ echo "::error::${*}"; exit 1; }
+note(){ echo "::notice::${*}"; }
 
-    if [ "$found" -ne 1 ]; then
-      echo "ERROR: no security artifacts found in $WS"
-      ls -la "$WS" || true
-      exit 2
-    fi
+find_once(){ find . -maxdepth 4 -type f -name "$1" -print -quit; }
 
-    echo "[gate] PRE passed"
-    ;;
+if [[ "$MODE" == "pre" ]]; then
+  note "Gate PRE: проверяем, что все артефакты SAST/SCA/Secrets есть на диске"
+  need=( "semgrep.sarif" "trivy-fs.sarif" "sbom.spdx.json" "gitleaks.json" )
+  for f in "${need[@]}"; do
+    p="$(find_once "$f" || true)"
+    [[ -n "${p:-}" && -s "$p" ]] || fail "Не найден артефакт: $f (скачать перед gate через actions/download-artifact)"
+    note "ok: $f -> $p"
+  done
+  note "Gate PRE: OK"
+  exit 0
+fi
 
-  dast)
-    echo "[gate] DAST: evaluating ZAP/Nuclei results"
-    ZAP_JSON="$WS/zap.json"
-    NUCLEI_TXT="$WS/nuclei.txt"
+if [[ "$MODE" == "dast" ]]; then
+  note "Gate DAST: анализ zap.json / nuclei.txt"
+  # jq для разбора zap.json
+  if ! command -v jq >/dev/null 2>&1; then
+    sudo apt-get update -y >/dev/null 2>&1 || true
+    sudo apt-get install -y jq >/dev/null 2>&1 || true
+  fi
 
-    sudo apt-get update -y >/dev/null
-    sudo apt-get install -y jq >/dev/null
+  zp="$(find_once 'zap.json' || true)"
+  [[ -n "${zp:-}" && -s "$zp" ]] || fail "zap.json не найден — проверь шаг ZAP baseline и монтирование -v \${{ github.workspace }}:/zap/wrk"
+  nu="$(find_once 'nuclei.txt' || true)"
+  [[ -n "${nu:-}" && -f "$nu" ]] || fail "nuclei.txt не найден — проверь шаг Nuclei"
 
-    if [[ ! -f "$ZAP_JSON" ]]; then
-      echo "ERROR: ZAP report not found at: $ZAP_JSON"
-      ls -la "$WS" || true
-      exit 2
-    fi
+  highs=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' "$zp" 2>/dev/null || echo 0)
+  meds=$(jq  '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' "$zp" 2>/dev/null || echo 0)
 
-    highs=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' "$ZAP_JSON")
-    meds=$(jq  '[.site[].alerts[] | select(.riskcode=="2")] | length' "$ZAP_JSON")
-    echo "ZAP High=$highs Medium=$meds"
+  note "ZAP: High=$highs Medium=$meds"
+  # Порог: любое High => fail, Medium > 5 => fail
+  if (( highs > 0 )); then fail "ZAP Gate: обнаружены High ($highs)"; fi
+  if (( meds  > 5 )); then fail "ZAP Gate: слишком много Medium ($meds > 5)"; fi
 
-    # Порог «по красоте»: High > 0 — блок, Medium > 5 — блок
-    if [[ "$highs" -gt 0 || "$meds" -gt 5 ]]; then
-      echo "ZAP gate FAIL (High=$highs, Medium=$meds)"
-      exit 1
-    fi
+  # Nuclei: если файл непустой — фейлим
+  if [[ -s "$nu" ]]; then
+    echo "----- nuclei findings -----"
+    sed -n '1,200p' "$nu" || true
+    fail "Nuclei: найдены уязвимости"
+  fi
 
-    if [[ -s "$NUCLEI_TXT" ]]; then
-      echo "Nuclei findings present:"
-      cat "$NUCLEI_TXT"
-      exit 1
-    fi
+  note "Gate DAST: OK"
+  exit 0
+fi
 
-    echo "[gate] DAST passed"
-    ;;
-
-  *)
-    echo "Usage: $0 {pre|dast}"
-    exit 64
-    ;;
-esac
+fail "неизвестный режим: $MODE (используй: pre | dast)"
