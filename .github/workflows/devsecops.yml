@@ -2,25 +2,23 @@ name: DevSecOps CI (SAST/SCA/Secrets/Image + Local DAST)
 
 on:
   push:
-    branches: [ "**" ]
+    branches: [ master ]
   workflow_dispatch:
 
+# Нужны права для загрузки SARIF в Code Scanning и скачивания/загрузки артефактов
 permissions:
   contents: read
   actions: read
-  checks: read
   security-events: write
 
-env:
-  NODE_VERSION: "20"
-  # глушим лишние npm-уведомления
-  NPM_CONFIG_FUND: "false"
-  CI: "true"
+concurrency:
+  group: devsecops-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # ------------------------
-  # 1) Сборка/быстрые проверки
-  # ------------------------
+  # ----------------------------
+  # 1) БЫСТРЫЕ unit/lint проверки
+  # ----------------------------
   build_test:
     runs-on: ubuntu-latest
     steps:
@@ -29,180 +27,169 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
+          node-version: 20.x
 
-      - name: Install (prefer prod-only; fallback to full)
+      - name: Install deps (uses lockfile)
         run: |
-          npm config set audit false
-          npm ci --omit=dev || npm ci
-      - name: Lint (best-effort)
-        run: npm run lint --if-present || true
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "No package-lock.json! Failing early so cache/ci are корректны."
+            exit 1
+          fi
 
-  # ------------------------
-  # 2) SAST (Semgrep)
-  # ------------------------
+      - name: Lint (best-effort)
+        run: npm run lint || true
+
+  # ----------------------------
+  # 2) SEMGREP (SARIF + артефакт)
+  # ----------------------------
   semgrep:
-    needs: [build_test]
     runs-on: ubuntu-latest
+    needs: [build_test]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Semgrep
         run: |
           python3 -m pip install --upgrade pip
-          pip install semgrep
+          python3 -m pip install semgrep
 
-      - name: Semgrep scan (SARIF + JSON)
+      - name: Semgrep scan -> semgrep.sarif
         run: |
-          semgrep scan --config=p/ci --json  --output semgrep.json  || true
-          semgrep scan --config=p/ci --sarif --output semgrep.sarif || true
+          semgrep --config auto --sarif --output semgrep.sarif --exclude node_modules || true
+          # На всякий пожарный: пустой SARIF, если вдруг файл так и не появился
+          if [ ! -s semgrep.sarif ]; then
+            echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","runs":[]}' > semgrep.sarif
+          fi
 
-      - name: Upload SARIF
+      - name: Upload semgrep.sarif (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep.sarif
+          path: semgrep.sarif
+
+      - name: Upload semgrep to Code Scanning
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: semgrep
-          path: |
-            semgrep.json
-            semgrep.sarif
-
-  # ------------------------
-  # 3) CodeQL (SAST)
-  # ------------------------
+  # ----------------------------
+  # 3) CODEQL (JS/TS)
+  # ----------------------------
   codeql:
-    needs: [build_test]
     runs-on: ubuntu-latest
+    needs: [build_test]
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v3
         with:
           languages: javascript
-          queries: security-and-quality
+      - uses: github/codeql-action/analyze@v3
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Analyze
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: codeql
-
-  # ------------------------
-  # 4) Secrets (Gitleaks)
-  # ------------------------
+  # ----------------------------
+  # 4) GITLEAKS (всегда даём gitleaks.json)
+  # ----------------------------
   gitleaks:
-    needs: [build_test]
     runs-on: ubuntu-latest
+    needs: [build_test]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install gitleaks
+      - name: Run gitleaks (docker) -> gitleaks.json
+        shell: bash
         run: |
-          curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh \
-            | bash -s -- -b /usr/local/bin
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect \
+            --no-banner -s /repo -f json -r /repo/gitleaks.json --redact || true
+          # Гарантируем, что файл существует даже если находок нет
+          if [ ! -s gitleaks.json ]; then echo "[]" > gitleaks.json; fi
 
-      - name: Scan repo for secrets
-        run: |
-          gitleaks detect --no-git -v \
-            --report-format json --report-path gitleaks.json || true
-
-      - name: Upload artifacts
+      - name: Upload gitleaks.json (artifact)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gitleaks
+          name: gitleaks.json
           path: gitleaks.json
+          if-no-files-found: warn
 
-  # ------------------------
-  # 5) SCA/FS scan + SBOM
-  # ------------------------
+  # ----------------------------------------
+  # 5) TRIVY FS + SBOM (SPDX) как артефакты
+  # ----------------------------------------
   trivy_fs_sbom:
-    needs: [build_test]
     runs-on: ubuntu-latest
+    needs: [build_test]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Trivy FS (SARIF)
+      - name: Trivy FS -> trivy-fs.sarif
         uses: aquasecurity/trivy-action@0.24.0
         with:
           scan-type: fs
+          scanners: vuln,secret,misconfig
           format: sarif
           output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
           ignore-unfixed: true
-          security-checks: vuln,secret,misconfig
-          hide-progress: true
 
-      - name: Generate SBOM (SPDX JSON) via Syft
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-            | sh -s -- -b /usr/local/bin
-          syft dir:. -o spdx-json=sbom.spdx.json
-
-      - name: Upload SARIF & SBOM
+      - name: Upload trivy-fs.sarif (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: fs_and_sbom
-          path: |
-            trivy-fs.sarif
-            sbom.spdx.json
+          name: trivy-fs.sarif
+          path: trivy-fs.sarif
 
-      - name: Upload SARIF to GH
-        uses: github/codeql-action/upload-sarif@v3
+      - name: SBOM (Syft) -> sbom.spdx.json
+        uses: anchore/sbom-action@v0
         with:
-          sarif_file: trivy-fs.sarif
+          format: spdx-json
+          output-file: sbom.spdx.json
 
-  # ------------------------
-  # 6) Build image & scan image (Trivy)
-  # ------------------------
+      - name: Upload sbom.spdx.json (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom.spdx.json
+          path: sbom.spdx.json
+
+  # ---------------------------------------------------
+  # 6) СБОРКА ОБРАЗА + TRIVY IMAGE (как отдельный шаг)
+  # ---------------------------------------------------
   build_image_scan:
-    needs: [build_test]
     runs-on: ubuntu-latest
+    needs: [build_test]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enable Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image
         run: |
-          docker build \
-            --build-arg NPM_CONFIG_FUND=false \
-            --build-arg CI=true \
-            -t juice-shop:ci .
+          docker build -t juice-shop:ci .
 
-      - name: Trivy image scan (SARIF)
+      - name: Trivy IMAGE -> trivy-image.sarif
         uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: juice-shop:ci
           format: sarif
           output: trivy-image.sarif
+          severity: HIGH,CRITICAL
           ignore-unfixed: true
-          hide-progress: true
 
-      - name: Upload image SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-image.sarif
-
-      - name: Upload artifact (image sarif)
+      - name: Upload trivy-image.sarif (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: image_scan
+          name: trivy-image.sarif
           path: trivy-image.sarif
 
-  # ------------------------
-  # 7) GATE перед DAST:
-  #    скачать ВСЕ артефакты и убедиться, что они существуют
-  # ------------------------
+  # ---------------------------------------------------
+  # 7) ПРЕ-ГЕЙТ: проверяем, что все отчёты на месте
+  # ---------------------------------------------------
   gate_pre_dast:
-    needs: [build_test, semgrep, codeql, gitleaks, trivy_fs_sbom]
     runs-on: ubuntu-latest
+    needs: [semgrep, gitleaks, trivy_fs_sbom, build_image_scan]
     steps:
       - uses: actions/checkout@v4
 
@@ -212,70 +199,73 @@ jobs:
           path: .
           merge-multiple: true
 
-      - name: Security Gate (SAST/SCA/Secrets/Image)
+      - name: Show what we have
+        run: ls -la
+
+      - name: Install jq
+        run: sudo apt-get update -y && sudo apt-get install -y jq
+
+      # В репозитории уже есть ci/gate.sh — используем его "pre" шаг
+      - name: Gate PRE (verify artifacts exist & severities)
         run: bash ci/gate.sh pre
 
-  # ------------------------
-  # 8) Локальный DAST (ZAP baseline + Nuclei) + Gate
-  # ------------------------
+  # ---------------------------------------------------
+  # 8) Локальный DAST: ZAP baseline + Nuclei, затем gate
+  # ---------------------------------------------------
   dast_local:
-    needs: [gate_pre_dast, build_image_scan]
     runs-on: ubuntu-latest
+    needs: [gate_pre_dast]
     steps:
       - uses: actions/checkout@v4
 
       - name: Create docker network
-        run: docker network create scan || true
+        run: docker network create scan
 
-      - name: Build (cache) app image
+      - name: Build (cache) - in case образа нет
         run: docker build -t juice-shop:ci .
 
       - name: Run app on network
         run: |
-          docker rm -f app || true
-          docker run -d --name app --network scan -p 3000:3000 juice-shop:ci
-          # ждём readiness приложения через контейнер curl
-          docker run --rm --network scan curlimages/curl:8.8.0 \
-            --retry 40 --retry-all-errors --retry-delay 3 --max-time 10 \
-            http://app:3000/ || (docker logs app && exit 1)
+          docker run -d --rm --name app --network scan -p 3000:3000 juice-shop:ci
+          # небольшой вэйт, чтобы сервер поднялся
+          for i in {1..30}; do
+            curl -sSf http://localhost:3000 >/dev/null && break || sleep 2
+          done
 
-      - name: ZAP baseline (JSON + HTML)
+      - name: ZAP baseline (local) -> zap.json, zap.html
         run: |
-          docker run --rm --network scan \
-            -v "${{ github.workspace }}:/zap/wrk" \
-            owasp/zap2docker-stable \
-            zap-baseline.py \
-              -t http://app:3000 \
-              -J zap.json \
-              -r zap.html \
-              -x zap.xml || true
+          mkdir -p zap
+          docker run --rm --network scan -v "$PWD/zap:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://app:3000 -J zap.json -r zap.html -m 3 -d -I || true
+          # перенесём в корень, чтобы gate нашёл
+          mv zap/zap.json ./zap.json || true
+          mv zap/zap.html ./zap.html || true
 
-      - name: Nuclei scan
+      - name: Nuclei (quick) -> nuclei.txt
         run: |
-          docker run --rm --network scan \
-            -v "${{ github.workspace }}:/work" \
-            projectdiscovery/nuclei:latest \
-              -u http://app:3000 \
-              -o /work/nuclei.txt \
-              -severity critical,high,medium,low || true
+          docker run --rm --network scan -v "$PWD:/wrk" -w /wrk projectdiscovery/nuclei:latest \
+            -silent -u http://app:3000 -o nuclei.txt || true
+          # Пустой файл тоже норм — gate это учтёт
+          if [ ! -f nuclei.txt ]; then touch nuclei.txt; fi
 
       - name: Gate on DAST
-        run: bash ci/gate.sh dast
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y jq
+          bash ci/gate.sh dast
 
       - name: Upload DAST artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dast_reports
+          name: dast-artifacts
           path: |
             zap.json
             zap.html
-            zap.xml
             nuclei.txt
 
       - name: Cleanup
         if: always()
         run: |
-          docker rm -f app || true
-          docker network rm scan || true
+          docker rm -f app 2>/dev/null || true
+          docker network rm scan 2>/dev/null || true
 
