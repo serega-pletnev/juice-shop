@@ -6,38 +6,36 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
 
-# 1) сперва только манифесты (чтоб кеш слоёв работал)
+# 1) только манифесты (кэш слоёв)
 COPY package*.json ./
-COPY frontend/package*.json ./frontend/ 2>/dev/null || true
+COPY frontend/package*.json ./frontend/
 
 ENV npm_config_audit=false npm_config_fund=false
 
-# 2) корневые зависимости БЕЗ скриптов, с fallback на install при отсутствии lock
+# 2) корневые зависимости (fallback на install, без скриптов)
 RUN if [ -f package-lock.json ]; then \
       npm ci --ignore-scripts --legacy-peer-deps; \
     else \
       npm install --ignore-scripts --legacy-peer-deps; \
     fi
 
-# 3) зависимости фронта (если есть), тоже с fallback
-RUN if [ -d frontend ]; then \
-      if [ -f frontend/package-lock.json ]; then \
-        npm ci --ignore-scripts --legacy-peer-deps --prefix frontend; \
-      else \
-        npm install --ignore-scripts --legacy-peer-deps --prefix frontend; \
-      fi; \
+# 3) зависимости фронта (fallback, без скриптов)
+RUN if [ -f frontend/package-lock.json ]; then \
+      npm ci --ignore-scripts --legacy-peer-deps --prefix frontend; \
+    else \
+      npm install --ignore-scripts --legacy-peer-deps --prefix frontend; \
     fi
 
-# 4) теперь копируем остальной код
+# 4) копируем остальной код
 COPY . .
 
-# 5) пересборка нативных модулей (теперь проект уже на месте)
+# 5) пересборка нативных модулей (когда проект уже на месте)
 RUN npm rebuild --unsafe-perm || true
-RUN if [ -d frontend ]; then npm --prefix frontend rebuild --unsafe-perm || true; fi
+RUN npm --prefix frontend rebuild --unsafe-perm || true
 
 # 6) сборка (если скрипты есть)
 RUN npm run build --if-present || true
-RUN if [ -d frontend ]; then npm --prefix frontend run build --if-present || true; fi
+RUN npm --prefix frontend run build --if-present || true
 
 # 7) оставляем только прод-зависимости
 RUN npm prune --omit=dev && npm cache clean --force
