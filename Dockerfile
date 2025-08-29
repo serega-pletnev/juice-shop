@@ -2,23 +2,34 @@
 FROM node:20-bookworm-slim AS builder
 WORKDIR /app
 
-# Инструменты для сборки нативных модулей
+# Инструменты для сборки нативных модулей и git-зависимостей
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates python3 make g++ \
+ && apt-get install -y --no-install-recommends ca-certificates git python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
 
-# Переносим ВСЁ сразу, чтобы lifecycle-скрипты видели папку frontend/
+# 1) сначала только манифесты (лучший кеш слоёв)
+COPY package*.json ./
+COPY frontend/package*.json ./frontend/
+
+# 2) ставим корневые зависимости БЕЗ lifecycle-скриптов
+ENV npm_config_audit=false npm_config_fund=false
+RUN npm ci --ignore-scripts --legacy-peer-deps
+
+# 3) зависимости фронта без скриптов
+RUN npm ci --ignore-scripts --legacy-peer-deps --prefix frontend
+
+# 4) теперь копируем остальной код
 COPY . .
 
-# Полная установка dev+prod для сборки
-RUN npm ci
+# 5) даём отработать postinstall/пересборке уже при наличии проекта
+RUN npm rebuild --unsafe-perm || true
+RUN npm --prefix frontend rebuild --unsafe-perm || true
 
-# Сборка (если в проекте есть соответствующие скрипты)
-# Для Juice Shop обычно достаточно стандартного build; на всякий случай пытаемся и сервер
-RUN npm run build --if-present || npm run build:frontend --if-present || true
-RUN npm run build:server --if-present || true
+# 6) сборка (если есть соответствующие скрипты)
+RUN npm run build --if-present || true
+RUN npm --prefix frontend run build --if-present || true
 
-# Оставляем только прод-зависимости
+# 7) отрезаем dev-зависимости и чистим кэш
 RUN npm prune --omit=dev && npm cache clean --force
 
 # ---------- Stage 2: runtime ----------
@@ -30,7 +41,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Берём готовые node_modules и собранные артефакты из builder
+# минимальный рантайм: прод-зависимости и собранные артефакты
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app ./
 
