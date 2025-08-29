@@ -127,19 +127,19 @@ jobs:
         run: docker build -t app-image:ci .
       - name: Run app on network
         run: |
-          docker run -d --name web --network scan -v ${{ github.workspace }}:/zap/wrk app-image:ci
+          docker run -d --name web --network scan -v ${{ github.workspace }}:/zap/wrk -v ${{ github.workspace }}:/zap/wrk app-image:ci
           for i in {1..40}; do
-            if docker run --rm --network scan -v ${{ github.workspace }}:/zap/wrk curlimages/curl:8.8.0 -sS http://web:3000 >/dev/null; then
+            if docker run --rm --network scan -v ${{ github.workspace }}:/zap/wrk -v ${{ github.workspace }}:/zap/wrk curlimages/curl:8.8.0 -sS http://web:3000 >/dev/null; then
               echo "app is up"; exit 0; fi; sleep 3;
           done
           echo "app did not start in time"; docker logs web; exit 1
       - name: ZAP baseline (local)
         run: |
-          docker run --rm --network scan -v ${{ github.workspace }}:/zap/wrk -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+          docker run --rm --network scan -v ${{ github.workspace }}:/zap/wrk -v ${{ github.workspace }}:/zap/wrk -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
             -t "http://web:3000" -r /zap/wrk/zap.html -J /zap/wrk/zap.json -m 5 -d -I
       - name: Nuclei (local)
         run: |
-          docker run --rm --network scan -v ${{ github.workspace }}:/zap/wrk projectdiscovery/nuclei:latest \
+          docker run --rm --network scan -v ${{ github.workspace }}:/zap/wrk -v ${{ github.workspace }}:/zap/wrk projectdiscovery/nuclei:latest \
             -u "http://web:3000" -severity critical,high -o nuclei.txt || true
       - uses: actions/upload-artifact@v4
         with:
