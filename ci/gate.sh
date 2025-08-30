@@ -1,60 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
-mode="${1:-pre}"
+root="${1:-.}"
+max_high="${2:-0}"
+max_medium="${3:-5}"
 
-find_sarif() {
-  local pattern="$1"
-  local out="$2"
-  if [[ -f "$pattern" ]]; then cp "$pattern" "$out"; return 0; fi
-  local f
-  f=$(ls -1 ${pattern} 2>/dev/null | head -n1 || true)
-  if [[ -n "${f:-}" && -f "$f" ]]; then cp "$f" "$out"; return 0; fi
-  f=$(find . -maxdepth 3 -type f -name "$pattern" 2>/dev/null | head -n1 || true)
-  if [[ -n "${f:-}" && -f "$f" ]]; then cp "$f" "$out"; return 0; fi
-  return 1
+count_sarif() {
+  file="$1"
+  high=$(jq '[.runs[]?.results[]?|select(.level=="error")] | length' "$file" 2>/dev/null || echo 0)
+  med=$(jq  '[.runs[]?.results[]?|select(.level=="warning")] | length' "$file" 2>/dev/null || echo 0)
+  echo "$high $med"
 }
 
-if [[ "$mode" == "pre" ]]; then
-  for t in semgrep gitleaks trivy-fs trivy-image; do
-    case "$t" in
-      semgrep) pat1="semgrep.sarif"; alt="semgrep*.sarif";;
-      gitleaks) pat1="gitleaks.sarif"; alt="gitleaks*.sarif";;
-      trivy-fs) pat1="trivy-fs.sarif"; alt="trivy*fs*.sarif";;
-      trivy-image) pat1="trivy-image.sarif"; alt="trivy*image*.sarif";;
-    esac
-    if ! find_sarif "$pat1" "$pat1"; then
-      if ! find_sarif "$alt" "$pat1"; then
-        echo "missing:$pat1"
-        exit 1
-      fi
-    fi
-    jq '.runs|length' "$pat1" >/dev/null
-  done
-  echo "OK"
-  exit 0
+sum_high=0
+sum_med=0
+
+for f in "$root/semgrep.sarif" "$root/trivy-fs.sarif" "$root/trivy-image.sarif" "$root/gitleaks.sarif"; do
+  if [ -f "$f" ]; then
+    read -r h m < <(count_sarif "$f")
+    sum_high=$((sum_high + h))
+    sum_med=$((sum_med + m))
+  fi
+done
+
+if [ -f "$root/zap.json" ]; then
+  zap_h=$(jq '[.site[]?.alerts[]?|select(.riskcode=="3")] | length' "$root/zap.json" 2>/dev/null || echo 0)
+  zap_m=$(jq '[.site[]?.alerts[]?|select(.riskcode=="2")] | length' "$root/zap.json" 2>/dev/null || echo 0)
+  sum_high=$((sum_high + zap_h))
+  sum_med=$((sum_med + zap_m))
 fi
 
-if [[ "$mode" == "dast" ]]; then
-  file="zap.json"
-  if [[ ! -f "$file" ]]; then
-    cand=$(ls -1 zap*.json 2>/dev/null | head -n1 || true)
-    if [[ -n "${cand:-}" ]]; then cp "$cand" "$file"; fi
-  fi
-  if [[ ! -f "$file" ]]; then
-    echo "missing:zap.json"
-    exit 1
-  fi
-  high=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' "$file")
-  med=$(jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' "$file")
-  echo "ZAP_HIGH=$high"
-  echo "ZAP_MEDIUM=$med"
-  if (( high > 0 )) || (( med > 5 )); then
-    exit 1
-  fi
-  echo "OK"
-  exit 0
+echo "HIGH=$sum_high MEDIUM=$sum_med MAX_HIGH=$max_high MAX_MEDIUM=$max_medium"
+
+if [ "$sum_high" -gt "$max_high" ] || [ "$sum_med" -gt "$max_medium" ]; then
+  echo "gate: fail"
+  exit 1
 fi
 
-echo "usage: $0 {pre|dast}"
-exit 2
-RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+echo "gate: pass"

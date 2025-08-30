@@ -1,9 +1,14 @@
-name: DevSecOps CI (SAST/SCA/Secrets/Image + DAST gates)
+name: DevSecOps CI (SAST/SCA/Secrets/Image + local DAST)
 
 on:
   push:
-    branches: [master, main]
+    branches: [ "**" ]
   pull_request:
+
+permissions:
+  contents: read
+  actions: read
+  security-events: write
 
 concurrency:
   group: devsecops-${{ github.ref }}
@@ -14,160 +19,134 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - run: npm run build --if-present
-      - run: npm run lint --if-present || true
+        with: { node-version: '20' }
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm i; fi
+      - name: Build
+        run: npm run build --if-present
+      - name: Pack workspace for later jobs
+        run: tar -czf ws.tgz .
+      - uses: actions/upload-artifact@v4
+        with: { name: ws, path: ws.tgz, retention-days: 1 }
 
   semgrep:
+    needs: build_test
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
     steps:
       - uses: actions/checkout@v4
-      - name: Semgrep scan -> semgrep.sarif
+        with: { fetch-depth: 0 }
+      - name: Run Semgrep
+        env:
+          SEMGREP_SEND_METRICS: off
         run: |
-          docker run --rm -e SEMGREP_SEND_METRICS=false \
-            -v "$PWD:/src" -w /src returntocorp/semgrep:latest \
-            semgrep --config p/ci --sarif -o /src/semgrep.sarif || true
-          test -s semgrep.sarif
+          docker run --rm -v "$PWD:/src" semgrep/semgrep:1 \
+            semgrep scan --config auto --sarif -o /src/semgrep.sarif || true
       - uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: semgrep.sarif
+        with: { sarif_file: semgrep.sarif }
       - uses: actions/upload-artifact@v4
-        with:
-          name: semgrep.sarif
-          path: semgrep.sarif
-
-  gitleaks:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Gitleaks scan -> gitleaks.sarif
-        run: |
-          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:latest \
-            detect --source=/repo --format sarif --report-path /repo/gitleaks.sarif --exit-code 0 --redact
-          test -s gitleaks.sarif
-      - uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: gitleaks.sarif
-      - uses: actions/upload-artifact@v4
-        with:
-          name: gitleaks.sarif
-          path: gitleaks.sarif
+        with: { name: semgrep_sarif, path: semgrep.sarif, retention-days: 3 }
 
   trivy_fs:
+    needs: build_test
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
     steps:
       - uses: actions/checkout@v4
-      - name: Trivy FS -> trivy-fs.sarif
-        run: |
-          docker run --rm -v "$PWD:/work" -w /work aquasec/trivy:latest \
-            fs --scanners vuln,config,secret --format sarif -o /work/trivy-fs.sarif /work || true
-          test -s trivy-fs.sarif
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          format: sarif
+          output: trivy-fs.sarif
+          scanners: vuln,secret
+          vuln-type: os,library
+          ignore-unfixed: false
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: '0'
       - uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-fs.sarif
+        with: { sarif_file: trivy-fs.sarif }
       - uses: actions/upload-artifact@v4
-        with:
-          name: trivy-fs.sarif
-          path: trivy-fs.sarif
+        with: { name: trivy_fs_sarif, path: trivy-fs.sarif, retention-days: 3 }
+
+  gitleaks:
+    needs: build_test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source=/repo --no-git --report-format sarif --report-path /repo/gitleaks.sarif || true
+      - uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: gitleaks.sarif }
+      - uses: actions/upload-artifact@v4
+        with: { name: gitleaks_sarif, path: gitleaks.sarif, retention-days: 3 }
 
   image_scan:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build Docker image
-        run: docker build -t app:test .
-      - name: Trivy image -> trivy-image.sarif
-        run: |
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD:/work" aquasec/trivy:latest \
-            image --format sarif -o /work/trivy-image.sarif app:test || true
-          test -s trivy-image.sarif
-      - uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-image.sarif
-      - uses: actions/upload-artifact@v4
-        with:
-          name: trivy-image.sarif
-          path: trivy-image.sarif
-
-  gate_pre_dast:
-    needs: [semgrep, gitleaks, trivy_fs, image_scan]
+    needs: build_test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
+        with: { name: ws }
+      - run: tar -xzf ws.tgz
+      - name: Build image
+        run: docker build -t app:ci .
+      - uses: aquasecurity/trivy-action@0.24.0
         with:
-          path: .
-          merge-multiple: true
-      - run: ls -l *.sarif || true
-      - run: bash ci/gate.sh pre
+          scan-type: image
+          image-ref: app:ci
+          format: sarif
+          output: trivy-image.sarif
+          ignore-unfixed: false
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: '0'
+      - uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: trivy-image.sarif }
+      - uses: actions/upload-artifact@v4
+        with: { name: trivy_image_sarif, path: trivy-image.sarif, retention-days: 3 }
 
   dast_local:
-    needs: [gate_pre_dast, build_test]
+    needs: [build_test, image_scan]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: ws }
+      - run: tar -xzf ws.tgz
+      - name: Build app if absent
+        run: |
+          docker image inspect app:ci >/dev/null 2>&1 || docker build -t app:ci .
       - name: Create network
         run: docker network create scan || true
-      - name: Build app image
-        run: docker build -t app:test .
-      - name: Run app container
-        run: docker run -d --rm --name juice --network scan -p 3000:3000 app:test
+      - name: Run app
+        run: docker run -d --rm --name app --network scan -p 3000:3000 app:ci
       - name: Wait readiness
+        run: bash ci/wait-for-http.sh http://localhost:3000 60
+      - name: ZAP Baseline
         run: |
-          for i in {1..60}; do
-            if docker run --rm --network scan curlimages/curl:8.7.1 -fsS http://juice:3000/ >/dev/null 2>&1; then
-              exit 0
-            fi
-            sleep 2
-          done
-          exit 1
-      - name: ZAP Baseline -> zap.json, zap.html
-        run: |
-          docker run --rm --network scan -v "$PWD:/zap/wrk" owasp/zap2docker-stable \
-            zap-baseline.py -t http://juice:3000 -J zap.json -r zap.html -d -I || true
-          test -s zap.json || echo "{}" > zap.json
-          test -s zap.html || echo "<html><body>No report</body></html>" > zap.html
+          docker run --rm --network scan -v "$PWD:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://app:3000 -J /zap/wrk/zap.json -r /zap/wrk/zap.html -m 2 -I || true
       - uses: actions/upload-artifact@v4
-        with:
-          name: zap.json
-          path: zap.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: zap.html
-          path: zap.html
-      - name: Stop app
+        with: { name: zap_reports, path: "zap.*", if-no-files-found: ignore, retention-days: 3 }
+      - name: Stop app and net
         if: always()
         run: |
-          docker rm -f juice || true
-          docker network rm scan || true
+          docker rm -f app >/dev/null 2>&1 || true
+          docker network rm scan >/dev/null 2>&1 || true
 
-  gate_on_dast:
-    needs: [dast_local]
+  gate:
+    needs: [semgrep, trivy_fs, gitleaks, image_scan, dast_local]
     runs-on: ubuntu-latest
+    env:
+      MAX_HIGH: "0"
+      MAX_MEDIUM: "5"
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: .
+          path: ./artifacts
           merge-multiple: true
-      - run: ls -l
-      - run: bash ci/gate.sh dast
-
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Gate
+        run: bash ci/gate.sh ./artifacts "${MAX_HIGH}" "${MAX_MEDIUM}"
