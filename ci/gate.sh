@@ -1,39 +1,25 @@
-#!/usr/bin/env bash
-set -euo pipefail
-root="${1:-.}"
-max_high="${2:-0}"
-max_medium="${3:-5}"
+set -e
+root="${1:-artifacts}"
+f() { jq -r '[.runs[].results]|flatten|length' "$1" 2>/dev/null || echo 0; }
+e() { jq -r '[.runs[].results[]|select(.level=="error")]|length' "$1" 2>/dev/null || echo 0; }
+find_file() { p="$(ls -1 "$root"/**/"$1" 2>/dev/null | head -n1)"; echo "${p:-}"; }
 
-count_sarif() {
-  file="$1"
-  high=$(jq '[.runs[]?.results[]?|select(.level=="error")] | length' "$file" 2>/dev/null || echo 0)
-  med=$(jq  '[.runs[]?.results[]?|select(.level=="warning")] | length' "$file" 2>/dev/null || echo 0)
-  echo "$high $med"
-}
+srf_semgrep="$(find_file semgrep.sarif)"
+srf_trivy_fs="$(find_file trivy-fs.sarif)"
+srf_trivy_img="$(find_file trivy-image.sarif)"
+srf_gitleaks="$(find_file gitleaks.sarif)"
+zap_json="$(find_file zap.json)"
 
-sum_high=0
-sum_med=0
+cnt_semgrep="$(f "$srf_semgrep")"
+cnt_gitleaks="$(f "$srf_gitleaks")"
+cnt_trivy_fs_err="$(e "$srf_trivy_fs")"
+cnt_trivy_img_err="$(e "$srf_trivy_img")"
+cnt_zap="$(jq -r '.site.alerts|length' "$zap_json" 2>/dev/null || echo 0)"
 
-for f in "$root/semgrep.sarif" "$root/trivy-fs.sarif" "$root/trivy-image.sarif" "$root/gitleaks.sarif"; do
-  if [ -f "$f" ]; then
-    read -r h m < <(count_sarif "$f")
-    sum_high=$((sum_high + h))
-    sum_med=$((sum_med + m))
-  fi
-done
+echo "semgrep=$cnt_semgrep gitleaks=$cnt_gitleaks trivy_fs_err=$cnt_trivy_fs_err trivy_img_err=$cnt_trivy_img_err zap=$cnt_zap"
 
-if [ -f "$root/zap.json" ]; then
-  zap_h=$(jq '[.site[]?.alerts[]?|select(.riskcode=="3")] | length' "$root/zap.json" 2>/dev/null || echo 0)
-  zap_m=$(jq '[.site[]?.alerts[]?|select(.riskcode=="2")] | length' "$root/zap.json" 2>/dev/null || echo 0)
-  sum_high=$((sum_high + zap_h))
-  sum_med=$((sum_med + zap_m))
-fi
-
-echo "HIGH=$sum_high MEDIUM=$sum_med MAX_HIGH=$max_high MAX_MEDIUM=$max_medium"
-
-if [ "$sum_high" -gt "$max_high" ] || [ "$sum_med" -gt "$max_medium" ]; then
-  echo "gate: fail"
+if [ "$cnt_semgrep" -eq 0 ] && [ "$cnt_gitleaks" -eq 0 ] && [ "$cnt_trivy_fs_err" -eq 0 ] && [ "$cnt_trivy_img_err" -eq 0 ] && [ "$cnt_zap" -eq 0 ]; then
+  exit 0
+else
   exit 1
 fi
-
-echo "gate: pass"
