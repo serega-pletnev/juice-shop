@@ -57,3 +57,4 @@ fi
 
 echo "usage: $0 {pre|dast}"
 exit 2
+RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
