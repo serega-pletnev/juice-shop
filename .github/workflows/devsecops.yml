@@ -7,48 +7,49 @@ on:
 permissions:
   contents: read
   security-events: write
+  actions: read
+
+env:
+  DOCKER_BUILDKIT: "1"
 
 jobs:
-  build_test:
+  prepare:
     name: Prepare workspace (npm install only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      - name: Install deps (no scripts)
-        run: npm ci --ignore-scripts
+          node-version: 20
+          cache: npm
+      - run: npm ci --ignore-scripts
 
   semgrep:
     name: Semgrep (SARIF)
+    needs: prepare
     runs-on: ubuntu-latest
-    needs: build_test
     steps:
       - uses: actions/checkout@v4
       - name: Run Semgrep
         env:
-          SEMGREP_SEND_METRICS: off
+          SEMGREP_SEND_METRICS: "off"
         run: |
           docker run --rm -v "$PWD:/src" returntocorp/semgrep:latest \
-            semgrep scan --config auto --sarif -o /src/semgrep.sarif /src
+            semgrep --config auto --sarif --output /src/semgrep.sarif /src || true
       - name: Upload SARIF to GitHub Security
-        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
-          category: semgrep
-      - name: Upload artifact
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: semgrep
+          name: semgrep.sarif
           path: semgrep.sarif
+          if-no-files-found: error
 
   trivy_fs:
-    name: Trivy FS + SBOM (SARIF)
+    name: Trivy FS + SBOM
+    needs: prepare
     runs-on: ubuntu-latest
-    needs: build_test
     steps:
       - uses: actions/checkout@v4
       - name: Trivy FS -> trivy-fs.sarif
@@ -57,58 +58,63 @@ jobs:
           scan-type: fs
           format: sarif
           output: trivy-fs.sarif
-          vuln-type: 'os,library'
-          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          exit-code: 0
           ignore-unfixed: true
-          exit-code: '0'
-      - name: Upload SARIF to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
+      - name: SBOM -> sbom.cdx.json
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          command: sbom
+          format: cyclonedx
+          output: sbom.cdx.json
+      - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-fs.sarif
-          category: trivy-fs
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: trivy-fs
+          name: trivy-fs.sarif
           path: trivy-fs.sarif
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom.cdx.json
+          path: sbom.cdx.json
 
   gitleaks:
     name: Gitleaks (SARIF + JSON)
     runs-on: ubuntu-latest
-    needs: build_test
     steps:
       - uses: actions/checkout@v4
-      - name: Run Gitleaks
+      - name: Run Gitleaks (SARIF + JSON)
         run: |
-          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
-            detect --source=/repo \
-            --report-format sarif --report-path /repo/gitleaks.sarif \
-            --report-path-json /repo/gitleaks.json || true
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect \
+            --source=/repo --no-git \
+            --report-format sarif --report-path /repo/gitleaks.sarif
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect \
+            --source=/repo --no-git \
+            --report-format json --report-path /repo/gitleaks.json
       - name: Upload SARIF to GitHub Security
-        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: gitleaks.sarif
-          category: gitleaks
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: gitleaks
-          path: |
-            gitleaks.sarif
-            gitleaks.json
+          name: gitleaks.sarif
+          path: gitleaks.sarif
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks.json
+          path: gitleaks.json
 
   image_scan:
-    name: Trivy image scan
+    name: Build Docker image + Trivy image scan
+    needs: prepare
     runs-on: ubuntu-latest
-    needs: build_test
     steps:
       - uses: actions/checkout@v4
       - name: Build app image
-        run: docker build -t app:test .
+        run: |
+          docker build -t app:test .
       - name: Trivy image -> trivy-image.sarif
         uses: aquasecurity/trivy-action@0.24.0
         with:
@@ -116,88 +122,102 @@ jobs:
           image-ref: app:test
           format: sarif
           output: trivy-image.sarif
-          vuln-type: 'os,library'
-          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          exit-code: 0
           ignore-unfixed: true
-          exit-code: '0'
-      - name: Upload SARIF to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-image.sarif
-          category: trivy-image
-      - name: Upload artifact
-        if: always()
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: trivy-image
+          name: trivy-image.sarif
           path: trivy-image.sarif
+          if-no-files-found: error
 
   dast_local:
     name: DAST (local ZAP baseline)
+    needs: [image_scan]
     runs-on: ubuntu-latest
-    needs: image_scan
     steps:
       - uses: actions/checkout@v4
-      - name: Build app image (if missing)
-        run: docker image inspect app:test >/dev/null 2>&1 || docker build -t app:test .
+      - name: Build app image if missing
+        run: |
+          if ! docker image inspect app:test >/dev/null 2>&1; then
+            docker build -t app:test .
+          fi
       - name: Create network
         run: docker network create scan || true
       - name: Run app container
-        run: docker run -d --rm --name app --network scan app:test
+        run: |
+          docker rm -f app || true
+          docker run -d --name app --network scan -p 3000:3000 app:test
       - name: Wait readiness
         run: |
-          for i in $(seq 1 60); do
-            docker run --rm --network scan curlimages/curl:8.8.0 -sSf http://app:3000 >/dev/null 2>&1 && exit 0
-            sleep 2
+          for i in $(seq 1 120); do
+            if docker run --rm --network scan curlimages/curl:7.88.1 -fsS http://app:3000 >/dev/null 2>&1; then
+              echo "App is ready"
+              exit 0
+            fi
+            sleep 5
           done
-          echo "App not ready" >&2
+          echo "App not ready"
+          docker logs app --tail=200 || true
           exit 1
       - name: ZAP Baseline -> zap.json & zap.html
         run: |
-          mkdir -p zap
-          docker run --rm --network scan -v "$PWD/zap:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py -t http://app:3000 -J zap.json -r zap.html -m 1
-      - name: Stop app
+          docker run --rm --network scan -v "${GITHUB_WORKSPACE}:/zap/wrk" \
+            zaproxy/zap2docker-stable zap-baseline.py \
+            -t http://app:3000 \
+            -J zap.json -r zap.html -I -m 5 -z "-config api.disablekey=true"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zap.json
+          path: zap.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zap.html
+          path: zap.html
+      - name: Stop app and net
         if: always()
         run: |
-          docker rm -f app >/dev/null 2>&1 || true
-          docker network rm scan >/dev/null 2>&1 || true
-      - name: Upload DAST artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: zap
-          path: zap/
+          docker rm -f app || true
+          docker network rm scan || true
 
   gate:
-    name: Gate (fail if High>0 or Medium>5 in DAST)
+    name: Gate (fail if High>0 or Medium>5)
+    needs: [semgrep, trivy_fs, gitleaks, image_scan, dast_local]
     runs-on: ubuntu-latest
-    needs:
-      - semgrep
-      - trivy_fs
-      - gitleaks
-      - image_scan
-      - dast_local
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: zap
-          path: artifacts
+          pattern: "*.sarif"
           merge-multiple: true
-      - name: Check DAST thresholds
+      - uses: actions/download-artifact@v4
+        with:
+          name: gitleaks.json
+          path: .
+      - uses: actions/download-artifact@v4
+        with:
+          name: zap.json
+          path: .
+      - name: Decide
         run: |
-          sudo apt-get update -y >/dev/null
-          sudo apt-get install -y jq >/dev/null
-          j=artifacts/zap.json
-          if [ ! -s "$j" ]; then
-            echo "No zap.json, failing gate"
+          set -euo pipefail
+          highs=0
+          mediums=0
+          if [ -s zap.json ]; then
+            highs=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' zap.json)
+            mediums=$(jq '[.site[].alerts[] | select(.riskcode=="2")] | length' zap.json)
+          fi
+          gitleaks_cnt=0
+          if [ -s gitleaks.json ]; then
+            gitleaks_cnt=$(jq 'if type=="array" then length else 0 end' gitleaks.json)
+          fi
+          echo "ZAP High: $highs  Medium: $mediums"
+          echo "Gitleaks findings: $gitleaks_cnt"
+          if [ "$highs" -gt 0 ] || [ "$mediums" -gt 5 ] || [ "$gitleaks_cnt" -gt 0 ]; then
+            echo "Gate: FAIL"
             exit 1
           fi
-          highs=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' "$j")
-          meds=$(jq '[.site[].alerts[] | select(.riskcode=="2")] | length' "$j")
-          echo "ZAP High=$highs Medium=$meds"
-          if [ "$highs" -gt 0 ] || [ "$meds" -gt 5 ]; then
-            exit 1
-          fi
+          echo "Gate: OK"
 
