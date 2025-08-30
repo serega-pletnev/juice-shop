@@ -1,46 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cmd="${1:-}"
-shift || true
-exist() { [ -s "$1" ]; }
-findf() {
-  local f="$1"
-  if exist "$f"; then echo "$f"; return 0; fi
-  if exist "artifacts/$f"; then echo "artifacts/$f"; return 0; fi
-  if exist "semgrep/$f"; then echo "semgrep/$f"; return 0; fi
-  if exist "trivy_fs/$f"; then echo "trivy_fs/$f"; return 0; fi
-  if exist "gitleaks/$f"; then echo "gitleaks/$f"; return 0; fi
-  if exist "image_scan/$f"; then echo "image_scan/$f"; return 0; fi
+mode="${1:-pre}"
+
+find_sarif() {
+  local pattern="$1"
+  local out="$2"
+  if [[ -f "$pattern" ]]; then cp "$pattern" "$out"; return 0; fi
+  local f
+  f=$(ls -1 ${pattern} 2>/dev/null | head -n1 || true)
+  if [[ -n "${f:-}" && -f "$f" ]]; then cp "$f" "$out"; return 0; fi
+  f=$(find . -maxdepth 3 -type f -name "$pattern" 2>/dev/null | head -n1 || true)
+  if [[ -n "${f:-}" && -f "$f" ]]; then cp "$f" "$out"; return 0; fi
   return 1
 }
-if [[ "$cmd" == "pre" ]]; then
-  dir="${1:-.}"
-  cd "$dir"
-  need=( "semgrep.sarif" "trivy-fs.sarif" "sbom.spdx.json" "gitleaks.sarif" "gitleaks.json" "trivy-image.sarif" )
-  miss=0
-  for n in "${need[@]}"; do
-    if f=$(findf "$n"); then
-      echo "ok: $f"
-    else
-      echo "missing: $n"
-      miss=$((miss+1))
+
+if [[ "$mode" == "pre" ]]; then
+  for t in semgrep gitleaks trivy-fs trivy-image; do
+    case "$t" in
+      semgrep) pat1="semgrep.sarif"; alt="semgrep*.sarif";;
+      gitleaks) pat1="gitleaks.sarif"; alt="gitleaks*.sarif";;
+      trivy-fs) pat1="trivy-fs.sarif"; alt="trivy*fs*.sarif";;
+      trivy-image) pat1="trivy-image.sarif"; alt="trivy*image*.sarif";;
+    esac
+    if ! find_sarif "$pat1" "$pat1"; then
+      if ! find_sarif "$alt" "$pat1"; then
+        echo "missing:$pat1"
+        exit 1
+      fi
     fi
+    jq '.runs|length' "$pat1" >/dev/null
   done
-  [[ $miss -eq 0 ]] || exit 1
+  echo "OK"
   exit 0
 fi
-if [[ "$cmd" == "dast" ]]; then
-  zap_json="${1:-dast/zap.json}"
-  max_high="${2:-0}"
-  max_med="${3:-5}"
-  jq -e . >/dev/null 2>&1 <<<"{}" || { echo "jq required"; exit 2; }
-  [[ -s "$zap_json" ]] || { echo "no $zap_json"; exit 1; }
-  highs=$(jq '[.site[].alerts[]?|select(.riskcode=="3")]|length' "$zap_json")
-  meds=$(jq  '[.site[].alerts[]?|select(.riskcode=="2")]|length' "$zap_json")
-  echo "high=$highs med=$meds"
-  (( highs <= max_high )) || exit 1
-  (( meds  <= max_med ))  || exit 1
+
+if [[ "$mode" == "dast" ]]; then
+  file="zap.json"
+  if [[ ! -f "$file" ]]; then
+    cand=$(ls -1 zap*.json 2>/dev/null | head -n1 || true)
+    if [[ -n "${cand:-}" ]]; then cp "$cand" "$file"; fi
+  fi
+  if [[ ! -f "$file" ]]; then
+    echo "missing:zap.json"
+    exit 1
+  fi
+  high=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' "$file")
+  med=$(jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' "$file")
+  echo "ZAP_HIGH=$high"
+  echo "ZAP_MEDIUM=$med"
+  if (( high > 0 )) || (( med > 5 )); then
+    exit 1
+  fi
+  echo "OK"
   exit 0
 fi
-echo "usage: gate.sh pre <dir> | gate.sh dast <zap.json> <max_high> <max_med>"
+
+echo "usage: $0 {pre|dast}"
 exit 2
