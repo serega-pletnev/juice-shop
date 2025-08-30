@@ -27,10 +27,6 @@ jobs:
           if [ -f package-lock.json ]; then npm ci; else npm i; fi
       - name: Build
         run: npm run build --if-present
-      - name: Pack workspace for later jobs
-        run: tar -czf ws.tgz .
-      - uses: actions/upload-artifact@v4
-        with: { name: ws, path: ws.tgz, retention-days: 1 }
 
   semgrep:
     needs: build_test
@@ -87,9 +83,7 @@ jobs:
     needs: build_test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
-        with: { name: ws }
-      - run: tar -xzf ws.tgz
+      - uses: actions/checkout@v4
       - name: Build image
         run: docker build -t app:ci .
       - uses: aquasecurity/trivy-action@0.24.0
@@ -111,10 +105,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/download-artifact@v4
-        with: { name: ws }
-      - run: tar -xzf ws.tgz
-      - name: Build app if absent
+      - uses: actions/checkout@v4
+      - name: Ensure image exists
         run: |
           docker image inspect app:ci >/dev/null 2>&1 || docker build -t app:ci .
       - name: Create network
@@ -129,7 +121,7 @@ jobs:
             zap-baseline.py -t http://app:3000 -J /zap/wrk/zap.json -r /zap/wrk/zap.html -m 2 -I || true
       - uses: actions/upload-artifact@v4
         with: { name: zap_reports, path: "zap.*", if-no-files-found: ignore, retention-days: 3 }
-      - name: Stop app and net
+      - name: Stop app and network
         if: always()
         run: |
           docker rm -f app >/dev/null 2>&1 || true
@@ -150,3 +142,4 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Gate
         run: bash ci/gate.sh ./artifacts "${MAX_HIGH}" "${MAX_MEDIUM}"
+
