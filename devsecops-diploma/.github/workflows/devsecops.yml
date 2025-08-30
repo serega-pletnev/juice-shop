@@ -1,0 +1,188 @@
+name: DevSecOps CI (SAST/SCA/Secrets/Image + DAST gates)
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+env:
+  IMAGE_NAME: app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm i; fi
+      - name: Build
+        run: npm run build || true
+
+  semgrep:
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan -> semgrep.sarif
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" -w /src returntocorp/semgrep:latest \
+            semgrep --config=auto --sarif --output semgrep.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semgrep
+          path: semgrep.sarif
+
+  trivy_fs:
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy FS -> trivy-fs.sarif
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            aquasec/trivy:latest \
+            fs --security-checks vuln,misconfig,secret \
+            --format sarif --output /src/trivy-fs.sarif /src
+      - name: SBOM -> sbom.cdx.json
+        run: |
+          docker run --rm -v "$PWD:/src" aquasec/trivy:latest \
+            fs --format cyclonedx --output /src/sbom.cdx.json /src
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs
+          path: |
+            trivy-fs.sarif
+            sbom.cdx.json
+
+  image_scan:
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t $IMAGE_NAME:$IMAGE_TAG .
+      - name: Trivy image -> trivy-image.sarif
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/" \
+            -v "$PWD:/src" aquasec/trivy:latest \
+            image --security-checks vuln \
+            --format sarif --output /src/trivy-image.sarif $IMAGE_NAME:$IMAGE_TAG
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image
+          path: trivy-image.sarif
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    needs: build_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gitleaks -> gitleaks.sarif
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source=/repo --redact \
+            --report-format sarif --report-path /repo/gitleaks.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks
+          path: gitleaks.sarif
+
+  gate_pre_dast:
+    runs-on: ubuntu-latest
+    needs: [semgrep, trivy_fs, image_scan, gitleaks]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          merge-multiple: true
+      - name: Ensure jq
+        run: sudo apt-get update -y && sudo apt-get install -y jq
+      - name: Pre-gate
+        run: ci/gate.sh pre
+
+  dast_local:
+    runs-on: ubuntu-latest
+    needs: [gate_pre_dast]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image if absent
+        run: |
+          if ! docker image inspect $IMAGE_NAME:$IMAGE_TAG >/dev/null 2>&1; then
+            docker build -t $IMAGE_NAME:$IMAGE_TAG .
+          fi
+      - name: Create network
+        run: docker network create scan || true
+      - name: Run app
+        run: |
+          docker rm -f app || true
+          docker run -d --name app --network scan $IMAGE_NAME:$IMAGE_TAG
+      - name: Wait readiness
+        run: |
+          for i in $(seq 1 60); do
+            if docker run --rm --network scan curlimages/curl:8.8.0 -fsS http://app:3000 >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: ZAP Baseline -> zap.json & zap.html
+        run: |
+          docker run --rm --network scan \
+            -v "$PWD:/zap/wrk" owasp/zap2docker-stable \
+            zap-baseline.py -t http://app:3000 \
+            -J zap.json -r zap.html -m 1 -d -I
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dast
+          path: |
+            zap.json
+            zap.html
+      - name: Stop app and net
+        if: always()
+        run: |
+          docker rm -f app || true
+          docker network rm scan || true
+
+  gate_on_dast:
+    runs-on: ubuntu-latest
+    needs: dast_local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dast
+          path: .
+      - name: Ensure jq
+        run: sudo apt-get update -y && sudo apt-get install -y jq
+      - name: DAST gate
+        run: ci/gate.sh dast
