@@ -143,7 +143,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Поднимаем app как отдельный контейнер (без services/command)
       - name: Build app image (again on this runner)
         run: docker build -t juice-shop:ci .
 
@@ -161,12 +160,17 @@ jobs:
           done
           echo "app failed to start"; docker ps -a; exit 1
 
+      # ⬇️ ВАЖНО: надёжный pull ZAP с Docker Hub + фолбэк на GHCR
       - name: ZAP Baseline (local) → zap.json & zap.html
         run: |
-          docker pull ghcr.io/zaproxy/zap2docker-stable:latest
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}:/zap/wrk" \
-            ghcr.io/zaproxy/zap2docker-stable:latest \
+          set -e
+          CANDIDATES=("zaproxy/zap2docker-stable:latest" "ghcr.io/zaproxy/zap2docker-stable:latest")
+          IMG=""
+          for c in "${CANDIDATES[@]}"; do
+            if docker pull "$c"; then IMG="$c"; break; else echo "WARN: pull failed for $c"; fi
+          done
+          if [ -z "$IMG" ]; then echo "ERR: no ZAP image pulled"; exit 1; fi
+          docker run --rm -v "${GITHUB_WORKSPACE}:/zap/wrk" "$IMG" \
             zap-baseline.py -t http://localhost:3000 \
               -m 1 -a -J zap.json -r zap.html -w zap.md || true
           echo "=== ZAP files ==="; ls -lh zap.* || true
@@ -182,8 +186,7 @@ jobs:
 
       - name: Stop app
         if: always()
-        run: |
-          docker rm -f web || true
+        run: docker rm -f web || true
 
   gate_on_dast:
     runs-on: ubuntu-latest
